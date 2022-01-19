@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -41,6 +43,10 @@ const authAppPayload = `{
 // Allow the client to set a shorter or longer time depending on their
 // environment
 const DefaultReqTimeoutVal uint32 = 100
+const DefaultMaxRetries uint32 = 0
+const DefaultBackoffMinDelay uint32 = 4
+const DefaultBackoffMaxDelay uint32 = 60
+const DefaultBackoffDelayFactor uint32 = 3
 const DefaultMOURL = "/api/node/mo"
 
 // Client is the main entry point
@@ -63,6 +69,10 @@ type Client struct {
 	skipLoggingPayload bool
 	appUserName        string
 	ValidateRelationDn bool
+	maxRetries         uint32
+	backoffMinDelay    uint32
+	backoffMaxDelay    uint32
+	backoffDelayFactor uint32
 	*ServiceManager
 }
 
@@ -122,6 +132,30 @@ func ProxyCreds(pcreds string) Option {
 func ValidateRelationDn(validateRelationDn bool) Option {
 	return func(client *Client) {
 		client.ValidateRelationDn = validateRelationDn
+	}
+}
+
+func MaxRetries(maxRetries uint32) Option {
+	return func(client *Client) {
+		client.maxRetries = maxRetries
+	}
+}
+
+func BackoffMinDelay(backoffMinDelay uint32) Option {
+	return func(client *Client) {
+		client.backoffMinDelay = backoffMinDelay
+	}
+}
+
+func BackoffMaxDelay(backoffMaxDelay uint32) Option {
+	return func(client *Client) {
+		client.backoffMaxDelay = backoffMaxDelay
+	}
+}
+
+func BackoffDelayFactor(backoffDelayFactor uint32) Option {
+	return func(client *Client) {
+		client.backoffDelayFactor = backoffDelayFactor
 	}
 }
 
@@ -464,33 +498,54 @@ func StrtoInt(s string, startIndex int, bitSize int) (int64, error) {
 }
 func (c *Client) Do(req *http.Request) (*container.Container, *http.Response, error) {
 	log.Printf("[DEBUG] Begining DO method %s", req.URL.String())
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !c.skipLoggingPayload {
-		log.Printf("\n\n\n HTTP request: %v", req.Body)
-	}
-	log.Printf("\nHTTP Request: %s %s", req.Method, req.URL.String())
-	if !c.skipLoggingPayload {
-		log.Printf("\nHTTP Response: %d %s %v", resp.StatusCode, resp.Status, resp)
-	} else {
-		log.Printf("\nHTTP Response: %d %s", resp.StatusCode, resp.Status)
+
+	for attempts := 0; ; attempts++ {
+		log.Printf("\nHTTP Request Method and URL: %s %s", req.Method, req.URL.String())
+		if !c.skipLoggingPayload {
+			log.Printf("\n\n\n HTTP Request Body: %v", req.Body)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			if ok := backoff(attempts); !ok {
+				return nil, nil, err
+			} else {
+				log.Printf("[ERROR] HTTP Connection failed: %s, retries: %v", err, attempts)
+				continue
+			}
+		}
+
+		if !c.skipLoggingPayload {
+			log.Printf("\nHTTP Response: %d %s %v", resp.StatusCode, resp.Status, resp)
+		} else {
+			log.Printf("\nHTTP Response: %d %s", resp.StatusCode, resp.Status)
+		}
+
+		bodyBytes, err := ioutil.ReadAll(resp.Body)
+		bodyStr := string(bodyBytes)
+		resp.Body.Close()
+		if !c.skipLoggingPayload {
+			log.Printf("\n HTTP response unique string %s %s %s", req.Method, req.URL.String(), bodyStr)
+		}
+
+		if resp.StatusCode < 500 && resp.StatusCode > 504 {
+			break
+		} else {
+			if ok := backoff(attempts); !ok {
+				break
+			} else {
+				log.Printf("[ERROR] HTTP Request failed: StatusCode %v, Retries: %v", resp.StatusCode, attempts)
+			}
+		}
 	}
 
-	bodyBytes, err := ioutil.ReadAll(resp.Body)
-	bodyStr := string(bodyBytes)
-	resp.Body.Close()
-	if !c.skipLoggingPayload {
-		log.Printf("\n HTTP response unique string %s %s %s", req.Method, req.URL.String(), bodyStr)
-	}
 	obj, err := container.ParseJSON(bodyBytes)
 
 	if err != nil {
-
 		log.Printf("Error occured while json parsing %+v", err)
 		return nil, resp, err
 	}
+
 	log.Printf("[DEBUG] Exit from do method")
 	return obj, resp, err
 
@@ -521,4 +576,38 @@ func stripQuotes(word string) string {
 		return strings.TrimSuffix(strings.TrimPrefix(word, "\""), "\"")
 	}
 	return word
+}
+
+func (c *Client) backoff(attempts int) bool {
+	maxRetries := DefaultMaxRetries
+	if c.maxRetries {
+		maxRetries = c.maxRetries
+	}
+	if attempts >= maxRetries {
+		return false
+	}
+
+	minDelay := DefaultBackoffMinDelay * time.Second
+	if c.backoffMinDelay {
+		timeout = c.backoffMinDelay * time.Second
+	}
+
+	maxDelay := DefaultBackoffMaxDelay * time.Second
+	if c.backoffMaxDelay {
+		timeout = c.backoffMaxDelay * time.Second
+	}
+
+	factor := DefaultBackoffDelayFactor * time.Second
+	if c.backoffDelayFactor {
+		timeout = c.backoffDelayFactor * time.Second
+	}
+
+	min := float64(minDelay)
+	backoff := min * math.Pow(factor, float64(attempts))
+	if backoff > float64(maxDelay) {
+		backoff = float64(maxDelay)
+	}
+	backoff = (rand.Float64()/2+0.5)*(backoff-min) + min
+	time.Sleep(time.Duration(backoff))
+	return true
 }
